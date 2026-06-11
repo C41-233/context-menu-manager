@@ -12,10 +12,10 @@ import os
 from datetime import datetime
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container
+from textual.containers import Container, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
-    Header, Footer, ListView, ListItem, Label,
+    Footer, ListView, ListItem, Label,
     TabbedContent, TabPane,
 )
 
@@ -87,6 +87,11 @@ class MenuListContainer(Container, can_focus=True):
     def on_mount(self):
         self._build_list()
 
+    def on_show(self):
+        """Tab 切回时恢复 ListView 焦点。"""
+        if self._list_view is not None:
+            self._list_view.focus()
+
     def _build_list(self):
         """重建列表。"""
         # 移除旧的 ListView（不设固定 ID，避免 DuplicateIds）
@@ -101,9 +106,12 @@ class MenuListContainer(Container, can_focus=True):
         for e in self.entries:
             status_icon = "●" if e.enabled else "○"
             status_text = "已启用" if e.enabled else "已禁用"
-            cmd_short = e.command[:50] + "..." if len(e.command) > 50 else e.command
             items.append(ListItem(
-                Label(f"{status_icon} {e.display_name}    {status_text}    {cmd_short}")
+                Label(
+                    f"{status_icon} [bold]{e.display_name}[/bold]    {status_text}\n"
+                    f"    注册表: HKCR\\{e.reg_path}\n"
+                    f"    命令: {e.command}"
+                )
             ))
         self._list_view = ListView(*items)
         self.mount(self._list_view)
@@ -120,26 +128,20 @@ class MenuListContainer(Container, can_focus=True):
 
     def _refresh_entries(self):
         """重新扫描并刷新列表。"""
-        try:
-            from menu_scanner import scan_entries, resolve_progid
-            if self.source_name == "*":
-                self.entries = scan_entries("*\\shell", "*")
-            elif self.source_name == "Directory":
-                self.entries = scan_entries("Directory\\shell", "Directory")
-            elif self.source_name == "Directory\\Background":
-                self.entries = scan_entries("Directory\\Background\\shell", "Directory\\Background")
+        from menu_scanner import scan_entries, resolve_progid
+        if self.source_name == "*":
+            self.entries = scan_entries("*\\shell", "*")
+        elif self.source_name == "Directory":
+            self.entries = scan_entries("Directory\\shell", "Directory")
+        elif self.source_name == "Directory\\Background":
+            self.entries = scan_entries("Directory\\Background\\shell", "Directory\\Background")
+        else:
+            progid = resolve_progid(self.source_name)
+            if progid:
+                self.entries = scan_entries(f"{progid}\\shell", self.source_name)
             else:
-                progid = resolve_progid(self.source_name)
-                if progid:
-                    self.entries = scan_entries(f"{progid}\\shell", self.source_name)
-                else:
-                    self.entries = []
-            self._build_list()
-        except Exception:
-            import traceback, os
-            with open(os.path.join(self.backup_dir, "crash_refresh.log"), "w", encoding="utf-8") as f:
-                traceback.print_exc(file=f)
-            raise
+                self.entries = []
+        self._build_list()
 
     def action_toggle(self):
         """切换启用/禁用状态。"""
@@ -209,6 +211,10 @@ class MenuListContainer(Container, can_focus=True):
 class MainScreen(Screen):
     """主屏幕 — 组合 Header/Footer 和菜单列表。"""
 
+    BINDINGS = [
+        Binding("tab", "switch_tab", "切换标签", show=False),
+    ]
+
     def __init__(self, sources: dict[str, list[MenuEntry]],
                  title_extra: str, backup_dir: str):
         super().__init__()
@@ -218,7 +224,7 @@ class MainScreen(Screen):
         self._containers: list[MenuListContainer] = []
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Label("[bold reverse] 右键菜单管理 — ContextMenuApp [/bold reverse]")
 
         if len(self.sources) > 1:
             with TabbedContent():
@@ -249,6 +255,22 @@ class MainScreen(Screen):
 
         yield Footer()
 
+    def action_switch_tab(self):
+        """Tab 键直接切换到下一个标签页。"""
+        try:
+            tabs = self.query_one(TabbedContent)
+        except Exception:
+            return
+        panes = list(self.query(TabPane))
+        if len(panes) <= 1:
+            return
+        active = tabs.active
+        for i, pane in enumerate(panes):
+            if pane.id == active:
+                next_pane = panes[(i + 1) % len(panes)]
+                tabs.active = next_pane.id
+                return
+
 
 class ContextMenuApp(App):
     """右键菜单管理 — Textual 主应用。"""
@@ -261,6 +283,16 @@ class ContextMenuApp(App):
         width: 60;
         height: auto;
         align: center middle;
+    }
+
+    ListView {
+        padding: 0 1;
+    }
+    ListView > ListItem {
+        padding: 0 1;
+    }
+    ListView > ListItem > Label {
+        padding: 0;
     }
     """
 
@@ -286,13 +318,16 @@ def launch_tui(sources: dict[str, list[MenuEntry]],
                title_extra: str, backup_dir: str):
     """启动 TUI 应用。"""
     import sys as _sys, traceback as _tb
+
+    tool_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(tool_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
     _orig_hook = _sys.excepthook
 
     def _crash_hook(exc_type, exc_value, exc_tb):
-        log_path = os.path.join(backup_dir, "crash_global.log")
+        log_path = os.path.join(log_dir, "crash.log")
         with open(log_path, "w", encoding="utf-8") as f:
             _tb.print_exception(exc_type, exc_value, exc_tb, file=f)
-        # 也打印到 stderr 以便控制台可见
         _tb.print_exception(exc_type, exc_value, exc_tb)
         _orig_hook(exc_type, exc_value, exc_tb)
 
