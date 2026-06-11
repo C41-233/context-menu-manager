@@ -32,7 +32,7 @@ def main():
         sources = scan_file_menus(args.file)
         title_extra = os.path.basename(args.file)
     elif args.dir:
-        sources = scan_directory_menus()
+        sources = scan_directory_menus(args.dir)
         title_extra = os.path.basename(args.dir)
     elif args.bg:
         sources = scan_background_menus()

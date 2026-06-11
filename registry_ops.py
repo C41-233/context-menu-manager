@@ -27,36 +27,16 @@ def resolve_indirect_string(raw: str) -> str:
     return raw
 
 
-# Windows 标准 Shell 动词的本地化名称
-_STANDARD_VERBS_ZH = {
-    "open": "打开(&O)",
-    "edit": "编辑(&E)",
-    "print": "打印(&P)",
-    "printto": "打印到...",
-    "find": "查找(&F)",
-    "explore": "资源管理器(&X)",
-    "play": "播放(&P)",
-    "preview": "预览(&V)",
-    "properties": "属性(&R)",
-    "runas": "以管理员身份运行(&A)",
-    "runasuser": "以其他用户身份运行(&U)",
-    "cut": "剪切(&T)",
-    "copy": "复制(&C)",
-}
-
-
 def resolve_display_name(key_handle, key_name: str = "") -> str:
     """从注册表键读取并解析显示名称。
 
-    优先: MUIVerb → 默认值 → 标准动词本地化 → 键名
+    优先级: MUIVerb → 默认值 → 键名
     对间接字符串执行 resolve_indirect_string 解析。
+    更上层的回退（COM、标准动词映射）在 menu_scanner 中处理。
     """
     raw = read_value(key_handle, "MUIVerb") or read_default_value(key_handle)
     if raw:
         return resolve_indirect_string(raw)
-    # 标准动词回退到本地化名称
-    if key_name.lower() in _STANDARD_VERBS_ZH:
-        return _STANDARD_VERBS_ZH[key_name.lower()]
     return key_name
 
 
