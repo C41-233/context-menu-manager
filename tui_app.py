@@ -64,14 +64,14 @@ class MenuListContainer(Container, can_focus=True):
     """菜单项列表容器 — 带键盘快捷键绑定。
 
     作为 Container 子类可被直接 compose 到 Screen 或 TabPane 中。
-    can_focus=True 使其可获得焦点以接收按键。
+    can_focus=True 确保容器在焦点链中（避免子控件移除时焦点落空），
+    但实际焦点始终委让给内部 ListView 以支持方向键导航。
     """
 
     BINDINGS = [
         Binding("space", "toggle", "启用/禁用"),
         Binding("delete", "delete_item", "删除"),
         Binding("r", "refresh", "刷新"),
-        Binding("q", "quit", "退出"),
         Binding("escape", "quit", "退出"),
     ]
 
@@ -89,9 +89,13 @@ class MenuListContainer(Container, can_focus=True):
 
     def _build_list(self):
         """重建列表。"""
-        # 移除旧的 ListView
-        for child in self.query(ListView):
-            child.remove()
+        # 移除旧的 ListView（不设固定 ID，避免 DuplicateIds）
+        if self._list_view is not None:
+            try:
+                self._list_view.remove()
+            except Exception:
+                pass
+            self._list_view = None
 
         items = []
         for e in self.entries:
@@ -101,36 +105,41 @@ class MenuListContainer(Container, can_focus=True):
             items.append(ListItem(
                 Label(f"{status_icon} {e.display_name}    {status_text}    {cmd_short}")
             ))
-        lv = ListView(*items, id="menu-list")
-        self.mount(lv)
-        lv.focus()
+        self._list_view = ListView(*items)
+        self.mount(self._list_view)
+        self._list_view.focus()
 
     def _get_selected_entry(self) -> MenuEntry | None:
         """获取当前选中的菜单项。"""
-        lv = self.query_one("#menu-list", ListView)
-        if lv.index is None:
+        if self._list_view is None or self._list_view.index is None:
             return None
-        idx = lv.index
+        idx = self._list_view.index
         if 0 <= idx < len(self.entries):
             return self.entries[idx]
         return None
 
     def _refresh_entries(self):
         """重新扫描并刷新列表。"""
-        from menu_scanner import scan_entries, resolve_progid
-        if self.source_name == "*":
-            self.entries = scan_entries("*\\shell", "*")
-        elif self.source_name == "Directory":
-            self.entries = scan_entries("Directory\\shell", "Directory")
-        elif self.source_name == "Directory\\Background":
-            self.entries = scan_entries("Directory\\Background\\shell", "Directory\\Background")
-        else:
-            progid = resolve_progid(self.source_name)
-            if progid:
-                self.entries = scan_entries(f"{progid}\\shell", self.source_name)
+        try:
+            from menu_scanner import scan_entries, resolve_progid
+            if self.source_name == "*":
+                self.entries = scan_entries("*\\shell", "*")
+            elif self.source_name == "Directory":
+                self.entries = scan_entries("Directory\\shell", "Directory")
+            elif self.source_name == "Directory\\Background":
+                self.entries = scan_entries("Directory\\Background\\shell", "Directory\\Background")
             else:
-                self.entries = []
-        self._build_list()
+                progid = resolve_progid(self.source_name)
+                if progid:
+                    self.entries = scan_entries(f"{progid}\\shell", self.source_name)
+                else:
+                    self.entries = []
+            self._build_list()
+        except Exception:
+            import traceback, os
+            with open(os.path.join(self.backup_dir, "crash_refresh.log"), "w", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+            raise
 
     def action_toggle(self):
         """切换启用/禁用状态。"""
@@ -256,7 +265,6 @@ class ContextMenuApp(App):
     """
 
     BINDINGS = [
-        Binding("q", "quit", "退出"),
         Binding("escape", "quit", "退出"),
     ]
 
@@ -277,5 +285,18 @@ class ContextMenuApp(App):
 def launch_tui(sources: dict[str, list[MenuEntry]],
                title_extra: str, backup_dir: str):
     """启动 TUI 应用。"""
+    import sys as _sys, traceback as _tb
+    _orig_hook = _sys.excepthook
+
+    def _crash_hook(exc_type, exc_value, exc_tb):
+        log_path = os.path.join(backup_dir, "crash_global.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            _tb.print_exception(exc_type, exc_value, exc_tb, file=f)
+        # 也打印到 stderr 以便控制台可见
+        _tb.print_exception(exc_type, exc_value, exc_tb)
+        _orig_hook(exc_type, exc_value, exc_tb)
+
+    _sys.excepthook = _crash_hook
+
     app = ContextMenuApp(sources, title_extra, backup_dir)
     app.run()

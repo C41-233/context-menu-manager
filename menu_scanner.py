@@ -102,9 +102,10 @@ def _resolve_final_display(verb: str, registry_display: str,
     if registry_display != verb:
         return registry_display
 
+    verb_lower = verb.lower()
+
     # 注册表只返回了键名，尝试 COM
     if com_overrides:
-        verb_lower = verb.lower()
         for com_verb, com_display in com_overrides.items():
             if com_verb.lower() == verb_lower:
                 return com_display
