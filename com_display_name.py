@@ -30,6 +30,21 @@ IID_IContextMenu = GUID(
     (0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46)
 )
 
+IID_IShellExtInit = GUID(
+    0x000214E8, 0x0000, 0x0000,
+    (0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46)
+)
+
+IID_IDataObject = GUID(
+    0x0000010E, 0x0000, 0x0000,
+    (0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46)
+)
+
+IID_IExplorerCommand = GUID(
+    0xA08CE4D0, 0xFA25, 0x44AB,
+    (0xB5, 0x7C, 0xC7, 0xB1, 0xC3, 0x23, 0xE0, 0xB9)
+)
+
 
 # === MENUITEMINFOW 结构 ===
 
@@ -139,6 +154,221 @@ def _enum_menu_items(hmenu, call_GetCommandString,
     return result
 
 
+def _enum_explorer_commands(pExplorerCommand, parent_display: str = ""
+                            ) -> dict[str, str]:
+    """递归遍历 IExplorerCommand 及其子命令，返回 {title: hierarchical_display_name}。"""
+    result: dict[str, str] = {}
+
+    call_GetTitle = _com_call(pExplorerCommand, 3, HRESULT,
+                              c_void_p, POINTER(c_void_p))
+    pTitle = c_void_p()
+    hr = call_GetTitle(None, byref(pTitle))
+    title = ""
+    if hr >= 0 and pTitle:
+        title = cast(pTitle, wintypes.LPWSTR).value or ""
+        ole32.CoTaskMemFree(pTitle)
+
+    if not title:
+        return result
+
+    hierarchical = f"{parent_display} ▸ {title}" if parent_display else title
+    result[title] = hierarchical
+
+    # EnumSubCommands (vtable index 10)
+    call_EnumSubCommands = _com_call(
+        pExplorerCommand, 10, HRESULT, POINTER(c_void_p),
+    )
+    pEnum = c_void_p()
+    hr = call_EnumSubCommands(byref(pEnum))
+    if hr >= 0 and pEnum:
+        # IEnumExplorerCommand::Next(ULONG celt, IExplorerCommand** pItems, ULONG* fetched)
+        call_Next = _com_call(
+            pEnum, 3, HRESULT,
+            wintypes.ULONG, POINTER(c_void_p), POINTER(wintypes.ULONG),
+        )
+        while True:
+            pItem = c_void_p()
+            fetched = wintypes.ULONG()
+            hr = call_Next(1, byref(pItem), byref(fetched))
+            if hr < 0 or fetched.value == 0:
+                break
+            sub = _enum_explorer_commands(pItem, hierarchical)
+            result.update(sub)
+            _com_release(pItem)
+        _com_release(pEnum)
+
+    return result
+
+
+# === 按 CLSID 实例化单个 Shell 扩展 ===
+
+def get_handler_menu_items(filepath: str, clsid_str: str) -> dict[str, str]:
+    """实例化单个 shellex 扩展并获取其菜单项。
+
+    对指定的 CLSID 进行 CoCreateInstance → IShellExtInit::Initialize →
+    IContextMenu::QueryContextMenu → 递归枚举，仅返回该扩展生成的菜单项。
+
+    Args:
+        filepath: 文件/目录的绝对路径（用于初始化 IShellExtInit）。
+        clsid_str: CLSID 字符串，如 "{B41DB860-...}"。
+
+    Returns:
+        verb_name → hierarchical_display_name 映射。失败返回空字典。
+    """
+    from log_utils import write_log as _wl
+
+    result: dict[str, str] = {}
+    filepath = os.path.abspath(filepath)
+    if not os.path.exists(filepath):
+        return result
+
+    co_init = ole32.CoInitializeEx(None, 2)
+    need_uninit = (co_init == 0)
+
+    pidl = None
+    psf = None
+    pdtobj = None
+    pcm = None
+    psei = None
+    hmenu = None
+
+    try:
+        # 1. 解析路径为 PIDL
+        pidl = c_void_p()
+        hr = shell32.SHParseDisplayName(filepath, None, byref(pidl), 0, None)
+        if hr != 0:
+            return result
+
+        # 2. 绑定父目录获取 IShellFolder + child PIDL
+        ppv = c_void_p()
+        child_pidl = c_void_p()
+        hr = shell32.SHBindToParent(
+            pidl, byref(IID_IShellFolder), byref(ppv), byref(child_pidl),
+        )
+        if hr != 0:
+            return result
+        psf = ppv
+
+        # 3. 从父目录获取 IDataObject（供 IShellExtInit 使用）
+        pdtobj_out = c_void_p()
+        call_GetUIObjectOf = _com_call(
+            psf, 10, HRESULT,
+            wintypes.HWND, wintypes.UINT,
+            c_void_p, c_void_p, c_void_p,
+            POINTER(c_void_p),
+        )
+        hr = call_GetUIObjectOf(
+            None, 1,
+            cast(byref(child_pidl), c_void_p),
+            cast(byref(IID_IDataObject), c_void_p),
+            None,
+            byref(pdtobj_out),
+        )
+        if hr == 0:
+            pdtobj = pdtobj_out
+
+        # 4. 解析 CLSID 并创建 COM 对象
+        clsid = GUID()
+        hr = ole32.CLSIDFromString(clsid_str, byref(clsid))
+        if hr != 0:
+            _wl(f"COM: CLSIDFromString 失败 {clsid_str}, HR=0x{hr & 0xFFFFFFFF:08X}")
+            return result
+
+        # 创建一个实例，获取 IContextMenu 接口
+        pcm = c_void_p()
+        hr = ole32.CoCreateInstance(
+            byref(clsid), None, 1,  # CLSCTX_INPROC_SERVER
+            byref(IID_IContextMenu), byref(pcm),
+        )
+        if hr != 0:
+            # 回退：尝试 IExplorerCommand（Win11 新接口）
+            pexplorer = c_void_p()
+            hr2 = ole32.CoCreateInstance(
+                byref(clsid), None, 1,
+                byref(IID_IExplorerCommand), byref(pexplorer),
+            )
+            if hr2 == 0:
+                result = _enum_explorer_commands(pexplorer)
+                _com_release(pexplorer)
+                return result
+            _wl(f"COM: CoCreateInstance 失败 {clsid_str}, IContextMenu=I0x{hr & 0xFFFFFFFF:08X}, IExplorerCommand=I0x{hr2 & 0xFFFFFFFF:08X}")
+            return result
+
+        # 5. 从同一对象 QueryInterface 获取 IShellExtInit 并初始化
+        call_QI = _com_call(pcm, 0, HRESULT, c_void_p, POINTER(c_void_p))
+        psei = c_void_p()
+        hr = call_QI(byref(IID_IShellExtInit), byref(psei))
+        if hr == 0:
+            # IShellExtInit::Initialize(pidlFolder, pdtobj, hkeyProgID)
+            call_Initialize = _com_call(
+                psei, 3, HRESULT,
+                c_void_p, c_void_p, c_void_p,
+            )
+            init_hr = call_Initialize(
+                cast(pidl, c_void_p),
+                pdtobj,
+                None,
+            )
+            if init_hr < 0:
+                _wl(f"COM: Initialize 失败 {clsid_str}, HR=0x{init_hr & 0xFFFFFFFF:08X}")
+
+        # 6. QueryContextMenu（同一个 COM 对象，已通过 IShellExtInit 初始化）
+        hmenu = user32.CreatePopupMenu()
+        call_QueryContextMenu = _com_call(
+            pcm, 3, HRESULT,
+            wintypes.HMENU, wintypes.UINT, wintypes.UINT,
+            wintypes.UINT, wintypes.UINT,
+        )
+        hr = call_QueryContextMenu(hmenu, 0, 1, 0x7FFF, 0)
+        if hr < 0:
+            _wl(f"COM: QueryContextMenu 失败 {clsid_str}, HR=0x{hr & 0xFFFFFFFF:08X}")
+            return result
+
+        # 7. 枚举 IContextMenu 菜单项
+        call_GetCommandString = _com_call(
+            pcm, 5, HRESULT,
+            _UINT_PTR, wintypes.UINT,
+            c_void_p, c_void_p, wintypes.UINT,
+        )
+        result = _enum_menu_items(hmenu, call_GetCommandString)
+
+        # 8. IContextMenu 返回空时，回退 IExplorerCommand（Win11 新接口）
+        if not result:
+            if hmenu:
+                user32.DestroyMenu(hmenu)
+                hmenu = None
+            pexplorer = c_void_p()
+            hr2 = ole32.CoCreateInstance(
+                byref(clsid), None, 1,
+                byref(IID_IExplorerCommand), byref(pexplorer),
+            )
+            if hr2 == 0:
+                # 释放 IContextMenu 接口，改用 IExplorerCommand
+                _com_release(psei)
+                psei = None
+                _com_release(pcm)
+                pcm = None
+                result = _enum_explorer_commands(pexplorer)
+                _com_release(pexplorer)
+
+    except Exception as exc:
+        _wl(f"COM: 实例化扩展 {clsid_str} 异常: {exc}")
+
+    finally:
+        if hmenu:
+            user32.DestroyMenu(hmenu)
+        _com_release(psei)
+        _com_release(pcm)
+        _com_release(pdtobj)
+        _com_release(psf)
+        if pidl:
+            ole32.CoTaskMemFree(pidl)
+        if need_uninit:
+            ole32.CoUninitialize()
+
+    return result
+
+
 # === 核心功能 ===
 
 def get_context_menu_display_names(filepath: str) -> dict[str, str]:
@@ -182,7 +412,7 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
         pidl = c_void_p()
         hr = shell32.SHParseDisplayName(filepath, None, byref(pidl), 0, None)
         if hr != 0:
-            _wl(f"COM: SHParseDisplayName 失败 {filepath}, HRESULT=0x{hr:08X}")
+            _wl(f"COM: SHParseDisplayName 失败 {filepath}, HRESULT=0x{hr & 0xFFFFFFFF:08X}")
             return result
 
         # 2. 绑定到父文件夹, 获取 IShellFolder 和子 PIDL
@@ -192,7 +422,7 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
             pidl, byref(IID_IShellFolder), byref(ppv), byref(child_pidl)
         )
         if hr != 0:
-            _wl(f"COM: SHBindToParent 失败 {filepath}, HRESULT=0x{hr:08X}")
+            _wl(f"COM: SHBindToParent 失败 {filepath}, HRESULT=0x{hr & 0xFFFFFFFF:08X}")
             return result
         psf = ppv
 
@@ -212,7 +442,7 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
             byref(pcm_out),
         )
         if hr != 0:
-            _wl(f"COM: GetUIObjectOf 失败 {filepath}, HRESULT=0x{hr:08X}")
+            _wl(f"COM: GetUIObjectOf 失败 {filepath}, HRESULT=0x{hr & 0xFFFFFFFF:08X}")
             return result
         pcm = pcm_out
 

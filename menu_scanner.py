@@ -167,11 +167,14 @@ def scan_ext_menus(ext_lower: str,
     return ext_menus
 
 
-def scan_shellex_handlers(subpath: str) -> list[MenuEntry]:
+def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
     """扫描 shellex\\ContextMenuHandlers 下的所有 Shell 扩展。
 
-    每个扩展作为一个 MenuEntry，reg_path 指向其 CLSID 键，
-    可被整体删除（删除后该扩展的全部菜单项消失）。
+    若有 filepath，对每个 CLSID 调用 COM 实例化获取真实子菜单项；
+    实例化失败则回退到仅显示注册表静态信息。
+
+    每个扩展的父级条目 reg_path 指向其 CLSID 键，可被整体删除；
+    子菜单条目仅作展示，不可单独操作。
     """
     handlers_path = f"{subpath}\\shellex\\ContextMenuHandlers"
     k = _try_open_key(handlers_path, winreg.KEY_READ)
@@ -188,16 +191,83 @@ def scan_shellex_handlers(subpath: str) -> list[MenuEntry]:
             break
 
         full_path = f"{handlers_path}\\{clsid}"
-        display_name = _read_value(full_path) or clsid
-        entries.append(MenuEntry(
-            name=clsid,
-            display_name=display_name,
-            command="由 Shell 扩展实现",
-            enabled=True,
-            reg_path=full_path,
-            source="ShellExt",
-            hidden_reason="包含动态子菜单，删除将移除整个扩展",
-        ))
+        default_val = _read_value(full_path)
+
+        # 显示名：优先用可读名称；若默认值是 CLSID 则键名才是可读名
+        if default_val and default_val.startswith("{"):
+            handler_name = clsid
+        else:
+            handler_name = default_val or clsid
+
+        # 确定实际 CLSID：按优先级 键名 → 默认值 → 遍历所有值
+        actual_clsid = clsid if clsid.startswith("{") else ""
+        if not actual_clsid and default_val and default_val.startswith("{"):
+            actual_clsid = default_val
+        if not actual_clsid:
+            hk = _try_open_key(full_path, winreg.KEY_READ)
+            if hk is not None:
+                j = 0
+                while True:
+                    try:
+                        vname, vdata, _ = winreg.EnumValue(hk, j)
+                        j += 1
+                        if isinstance(vdata, str) and vdata.startswith("{"):
+                            actual_clsid = vdata
+                            break
+                    except OSError:
+                        break
+                hk.Close()
+
+        if filepath and actual_clsid:
+            from com_display_name import get_handler_menu_items
+            items = get_handler_menu_items(filepath, actual_clsid)
+            if items:
+                # 父级条目 — 有 reg_path，可删除
+                entries.append(MenuEntry(
+                    name=handler_name,
+                    display_name=handler_name,
+                    command="由 Shell 扩展实现",
+                    enabled=True,
+                    reg_path=full_path,
+                    source="Shell 扩展",
+                    hidden_reason="删除将移除整个扩展",
+                ))
+                for verb, display in items.items():
+                    # 有些扩展返回的 display 已自带前缀（如 7-Zip），
+                    # 有些没有（如 TortoiseGit），按需加前缀
+                    if display.lstrip("&").startswith(handler_name):
+                        child_display = display
+                    else:
+                        child_display = f"{handler_name} ▸ {display}"
+                    entries.append(MenuEntry(
+                        name=verb,
+                        display_name=child_display,
+                        command="",
+                        enabled=True,
+                        reg_path="",
+                        source="Shell 扩展",
+                        hidden_reason="由 Shell 扩展提供",
+                    ))
+            else:
+                entries.append(MenuEntry(
+                    name=handler_name,
+                    display_name=handler_name,
+                    command="由 Shell 扩展实现",
+                    enabled=True,
+                    reg_path=full_path,
+                    source="Shell 扩展",
+                    hidden_reason="无法获取子菜单（COM 实例化失败）",
+                ))
+        else:
+            entries.append(MenuEntry(
+                name=handler_name,
+                display_name=handler_name,
+                command="由 Shell 扩展实现",
+                enabled=True,
+                reg_path=full_path,
+                source="Shell 扩展",
+                hidden_reason="包含动态子菜单，删除将移除整个扩展",
+            ))
 
     k.Close()
     return entries
@@ -266,10 +336,10 @@ def scan_file_menus(filepath: str) -> dict[str, list[MenuEntry]]:
     # 5. 补充 COM 独有的菜单项（shellex 扩展）
     _merge_com_entries(result, com_names, ext_lower or "*")
 
-    # 6. Shell 扩展（shellex\ContextMenuHandlers）— 作为可删除的整体入口
-    shellex_entries = scan_shellex_handlers("*")
+    # 6. Shell 扩展（shellex\ContextMenuHandlers）— 实例化获取真实子菜单
+    shellex_entries = scan_shellex_handlers("*", filepath)
     if ext_lower:
-        shellex_entries.extend(scan_shellex_handlers(ext_lower))
+        shellex_entries.extend(scan_shellex_handlers(ext_lower, filepath))
     if shellex_entries:
         result["Shell 扩展"] = shellex_entries
 
@@ -285,7 +355,7 @@ def scan_directory_menus(dirpath: str = "") -> dict[str, list[MenuEntry]]:
     result = {"Directory": scan_entries("Directory\\shell", "Directory", com_names)}
     if com_names:
         _merge_com_entries(result, com_names, "Directory")
-    shellex_entries = scan_shellex_handlers("Directory")
+    shellex_entries = scan_shellex_handlers("Directory", dirpath)
     if shellex_entries:
         result["Shell 扩展"] = shellex_entries
     return result

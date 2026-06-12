@@ -47,6 +47,8 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
             Label("即将从注册表删除以下菜单项："),
             Label(f"[bold]{self.entry.reg_path}[/bold]"),
             Label(f"  └── command: {self.entry.command}"),
+            *([Label(""), Label(f"[bold yellow]注意: {self.entry.hidden_reason}[/bold yellow]")]
+              if self.entry.hidden_reason else []),
             Label(""),
             Label("此操作[bold]不可撤销[/bold]！"),
             Label(f"恢复文件将保存至: backups\\{self.backup_filename}"),
