@@ -39,7 +39,7 @@ def main():
         title_extra = os.path.basename(args.bg)
 
     # 启动 TUI
-    launch_tui(sources, title_extra, backup_dir)
+    launch_tui(sources, title_extra, backup_dir, sys.argv)
 
 
 if __name__ == "__main__":

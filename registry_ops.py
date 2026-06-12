@@ -84,15 +84,13 @@ def list_subkeys(key_handle) -> list[str]:
     return keys
 
 
-def read_shell_entries(subpath: str) -> list[dict]:
-    """枚举 subpath 下所有子键，返回原始信息列表。
-
-    每个 dict 包含: name, display_name, command, enabled, reg_path
-    """
-    entries = []
+def _read_shell_recursive(subpath: str, parent_display: str,
+                          parent_hidden: str,
+                          entries: list[dict]):
+    """递归扫描 shell 子键，展开级联子菜单。"""
     shell_key = _try_open_key(subpath, winreg.KEY_READ)
     if shell_key is None:
-        return entries
+        return
 
     for name in list_subkeys(shell_key):
         full_path = f"{subpath}\\{name}"
@@ -100,31 +98,68 @@ def read_shell_entries(subpath: str) -> list[dict]:
         if item_key is None:
             continue
 
-        # 读取显示名：间接字符串解析 + 标准动词本地化 + 多重回退
         display_name = resolve_display_name(item_key, name)
+        if parent_display:
+            display_name = f"{parent_display} ▸ {display_name}"
 
-        # 读取命令
         command = ""
         cmd_key = _try_open_key(f"{full_path}\\command", winreg.KEY_READ)
         if cmd_key is not None:
             command = read_default_value(cmd_key) or ""
             cmd_key.Close()
 
-        # 检查是否禁用
         legacy_disable = read_value(item_key, "LegacyDisable")
         enabled = legacy_disable is None
 
+        # 检测隐藏原因
+        hidden_reasons = []
+        has_ext_val = read_value(item_key, "Extended")
+        has_ext_key = _try_open_key(f"{full_path}\\Extended", winreg.KEY_READ)
+        if has_ext_val is not None or has_ext_key is not None:
+            hidden_reasons.append("按住 Shift 显示")
+        if has_ext_key is not None:
+            has_ext_key.Close()
+
+        subcommands = read_value(item_key, "Subcommands")
+        nested = f"{full_path}\\shell"
+        has_nested = _try_open_key(nested, winreg.KEY_READ) is not None
+        invalid_sub = (subcommands == "" and has_nested)
+        if invalid_sub:
+            hidden_reasons.append("Subcommands 异常，未显示")
+
         item_key.Close()
 
-        entries.append({
-            "name": name,
-            "display_name": display_name,
-            "command": command,
-            "enabled": enabled,
-            "reg_path": full_path,
-        })
+        # 拼接标记字符串
+        tag = ", ".join(hidden_reasons)
+        if parent_hidden:
+            tag = f"{parent_hidden}, {tag}" if tag else parent_hidden
+
+        if command or not has_nested:
+            entries.append({
+                "name": name,
+                "display_name": display_name,
+                "command": command,
+                "enabled": enabled,
+                "reg_path": full_path,
+                "hidden_reason": tag or None,
+            })
+
+        if has_nested:
+            child_hidden = parent_hidden
+            if invalid_sub and not command:
+                child_hidden = f"{child_hidden}, Subcommands 异常，未显示" if child_hidden else "Subcommands 异常，未显示"
+            _read_shell_recursive(nested, display_name, child_hidden, entries)
 
     shell_key.Close()
+
+
+def read_shell_entries(subpath: str) -> list[dict]:
+    """枚举 subpath 下所有子键（含级联展开），返回原始信息列表。
+
+    每个 dict 包含: name, display_name, command, enabled, reg_path
+    """
+    entries: list[dict] = []
+    _read_shell_recursive(subpath, "", "", entries)
     return entries
 
 
@@ -211,13 +246,34 @@ def _delete_key_recursive(parent_path: str, key_name: str):
     parent.Close()
 
 
+def resolve_hkcr_root(reg_path: str) -> str:
+    """探测 HKCR 键的实际物理位置。
+
+    尝试在 HKCU\\Software\\Classes 和 HKLM\\Software\\Classes 下打开该键，
+    返回 \"HKEY_CURRENT_USER\\Software\\Classes\" 或 \"HKEY_LOCAL_MACHINE\\Software\\Classes\"。
+    均失败则回退到 \"HKEY_CLASSES_ROOT\"。
+    """
+    for hive, prefix in [
+        (winreg.HKEY_CURRENT_USER, r"HKEY_CURRENT_USER\Software\Classes"),
+        (winreg.HKEY_LOCAL_MACHINE, r"HKEY_LOCAL_MACHINE\Software\Classes"),
+    ]:
+        try:
+            k = winreg.OpenKey(hive, f"Software\\Classes\\{reg_path}", 0, winreg.KEY_READ)
+            k.Close()
+            return prefix
+        except FileNotFoundError:
+            continue
+    return "HKEY_CLASSES_ROOT"
+
+
 def export_as_reg(key_tree: dict, reg_path: str) -> str:
     """将 read_key_tree 的结果转换为 .reg 文件内容字符串。
 
-    reg_path: 完整注册表路径，如 HKCR\\\\*\\\\shell\\\\EditPlus
+    reg_path: HKCR 下的相对路径，如 *\\shell\\EditPlus
     """
+    root = resolve_hkcr_root(reg_path)
     lines = ["Windows Registry Editor Version 5.00", ""]
-    _export_section(lines, f"HKEY_CLASSES_ROOT\\{reg_path}", key_tree)
+    _export_section(lines, f"{root}\\{reg_path}", key_tree)
     return "\r\n".join(lines)
 
 

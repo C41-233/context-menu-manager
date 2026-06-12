@@ -10,6 +10,7 @@
 
 import os
 from datetime import datetime
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Vertical
@@ -23,6 +24,32 @@ from menu_scanner import MenuEntry
 from registry_ops import (
     set_disabled, read_key_tree, delete_key_tree, export_as_reg,
 )
+
+
+class ConfirmElevateScreen(ModalScreen[bool]):
+    """提权确认弹窗。"""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "取消"),
+        Binding("enter", "confirm", "确认提权"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("[bold yellow]⚠ 需要管理员权限[/bold yellow]"),
+            Label(""),
+            Label("该注册表项位于系统级路径，需要管理员权限才能删除。"),
+            Label("是否以管理员身份重启本工具？"),
+            Label(""),
+            Label("[bold]Enter[/bold] 确认提权    [bold]Esc[/bold] 取消"),
+            id="confirm-dialog",
+        )
+
+    def action_confirm(self):
+        self.dismiss(True)
+
+    def action_cancel(self):
+        self.dismiss(False)
 
 
 class ConfirmDeleteScreen(ModalScreen[bool]):
@@ -76,12 +103,14 @@ class MenuListContainer(Container, can_focus=True):
     ]
 
     def __init__(self, entries: list[MenuEntry], source_name: str,
-                 title_extra: str, backup_dir: str, **kwargs):
+                 title_extra: str, backup_dir: str,
+                 argv: list[str] | None = None, **kwargs):
         super().__init__(**kwargs)
         self.entries = entries
         self.source_name = source_name
         self.title_extra = title_extra
         self.backup_dir = backup_dir
+        self._argv = argv
         self._list_view = None
 
     def on_mount(self):
@@ -106,11 +135,18 @@ class MenuListContainer(Container, can_focus=True):
         for e in self.entries:
             status_icon = "●" if e.enabled else "○"
             status_text = "已启用" if e.enabled else "已禁用"
+            # 第二行：状态 + 隐藏标记
+            line2 = f"    {status_text}"
+            if e.hidden_reason:
+                line2 += f"    [dim][{e.hidden_reason}][/dim]"
+            # 命令显示
+            cmd = e.command if e.command else "（无命令，由 Shell 扩展实现）"
             items.append(ListItem(
                 Label(
-                    f"{status_icon} [bold]{e.display_name}[/bold]    {status_text}\n"
+                    f"{status_icon} [bold]{e.display_name}[/bold]\n"
+                    f"{line2}\n"
                     f"    注册表: HKCR\\{e.reg_path}\n"
-                    f"    命令: {e.command}"
+                    f"    命令: {cmd}"
                 )
             ))
         self._list_view = ListView(*items)
@@ -153,53 +189,82 @@ class MenuListContainer(Container, can_focus=True):
         entry.enabled = new_state
         self._build_list()
 
-    async def action_delete_item(self):
-        """删除菜单项（先备份后删除）。"""
+    def action_delete_item(self):
+        """删除菜单项 — 入口，将实际逻辑交给 Worker 执行。"""
         entry = self._get_selected_entry()
         if entry is None:
             return
+        self._do_delete(entry)
 
-        # 生成备份文件名
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        safe_source = self.source_name.replace("\\", "_").replace("*", "Star")
-        safe_name = entry.name.replace("\\", "_").replace("/", "_")
-        filename = f"{timestamp}_{safe_source}_{safe_name}.reg"
-        backup_path = os.path.join(self.backup_dir, filename)
-
-        # 弹出确认对话框
-        screen = ConfirmDeleteScreen(entry, filename)
-        confirmed = await self.app.push_screen_wait(screen)
-
-        if not confirmed:
-            return
-
-        # 1. 读取键树并生成备份
+    @work
+    async def _do_delete(self, entry: MenuEntry):
+        """Worker: 删除菜单项（先备份后删除）。"""
         try:
-            key_tree = read_key_tree(entry.reg_path)
-            reg_content = export_as_reg(key_tree, entry.reg_path)
-            with open(backup_path, "w", encoding="utf-16-le") as f:
-                f.write(reg_content)
-        except Exception as exc:
-            self.app.notify(
-                f"备份写入失败，删除已取消: {exc}",
-                severity="error",
-            )
-            return
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            safe_source = self.source_name.replace("\\", "_").replace("*", "Star")
+            safe_name = entry.name.replace("\\", "_").replace("/", "_")
+            filename = f"{timestamp}_{safe_source}_{safe_name}.reg"
+            backup_path = os.path.join(self.backup_dir, filename)
 
-        # 2. 执行删除
-        try:
-            delete_key_tree(entry.reg_path)
-        except Exception as exc:
-            self.app.notify(
-                f"删除失败（备份文件已保留: {filename}）: {exc}",
-                severity="error",
-            )
+            screen = ConfirmDeleteScreen(entry, filename)
+            confirmed = await self.app.push_screen_wait(screen)
+
+            if not confirmed:
+                return
+
+            # 1. 读取键树并生成备份
+            try:
+                key_tree = read_key_tree(entry.reg_path)
+                reg_content = export_as_reg(key_tree, entry.reg_path)
+                with open(backup_path, "w", encoding="utf-16") as f:
+                    f.write(reg_content)
+            except Exception as exc:
+                self.app.notify(
+                    f"备份写入失败，删除已取消: {exc}",
+                    severity="error",
+                )
+                return
+
+            # 2. 执行删除
+            try:
+                delete_key_tree(entry.reg_path)
+            except PermissionError:
+                # 提权重试
+                screen = ConfirmElevateScreen()
+                elevate = await self.app.push_screen_wait(screen)
+                if elevate:
+                    self._restart_as_admin()
+                else:
+                    self._refresh_entries()
+                return
+            except Exception as exc:
+                self.app.notify(
+                    f"删除失败（备份文件已保留: {filename}）: {exc}",
+                    severity="error",
+                )
+                self._refresh_entries()
+                return
+
+            # 3. 成功
+            self.app.notify(f"已删除，恢复文件: backups\\{filename}")
             self._refresh_entries()
-            return
+        except Exception:
+            import traceback
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, "crash_delete.log"), "w", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+            raise
 
-        # 3. 成功
-        self.app.notify(f"已删除，恢复文件: backups\\{filename}")
-        self._refresh_entries()
+    def _restart_as_admin(self):
+        """以管理员权限重启本工具（保留原命令行参数）。"""
+        import ctypes
+        argv = self._argv or []
+        args = " ".join(f'"{a}"' for a in argv[1:]) if len(argv) > 1 else ""
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", argv[0] if argv else "", args, None, 1
+        )
+        self.app.exit()
 
     def action_refresh(self):
         self._refresh_entries()
@@ -216,11 +281,13 @@ class MainScreen(Screen):
     ]
 
     def __init__(self, sources: dict[str, list[MenuEntry]],
-                 title_extra: str, backup_dir: str):
+                 title_extra: str, backup_dir: str,
+                 argv: list[str] | None = None):
         super().__init__()
         self.sources = sources
         self.title_extra = title_extra
         self.backup_dir = backup_dir
+        self._argv = argv
         self._containers: list[MenuListContainer] = []
 
     def compose(self) -> ComposeResult:
@@ -237,6 +304,7 @@ class MainScreen(Screen):
                         container = MenuListContainer(
                             entries, source_name,
                             self.title_extra, self.backup_dir,
+                            argv=self._argv,
                         )
                         self._containers.append(container)
                         yield container
@@ -245,6 +313,7 @@ class MainScreen(Screen):
             container = MenuListContainer(
                 entries, source_name,
                 self.title_extra, self.backup_dir,
+                argv=self._argv,
             )
             self._containers.append(container)
             yield Label(
@@ -301,21 +370,25 @@ class ContextMenuApp(App):
     ]
 
     def __init__(self, sources: dict[str, list[MenuEntry]],
-                 title_extra: str, backup_dir: str):
+                 title_extra: str, backup_dir: str,
+                 argv: list[str] | None = None):
         super().__init__()
         self.sources = sources
         self.title_extra = title_extra
         self.backup_dir = backup_dir
+        self._argv = argv
 
     def on_mount(self):
-        self.push_screen(MainScreen(self.sources, self.title_extra, self.backup_dir))
+        self.push_screen(MainScreen(self.sources, self.title_extra,
+                                    self.backup_dir, self._argv))
 
     def action_quit(self):
         self.exit()
 
 
 def launch_tui(sources: dict[str, list[MenuEntry]],
-               title_extra: str, backup_dir: str):
+               title_extra: str, backup_dir: str,
+               argv: list[str] | None = None):
     """启动 TUI 应用。"""
     import sys as _sys, traceback as _tb
 
@@ -333,5 +406,5 @@ def launch_tui(sources: dict[str, list[MenuEntry]],
 
     _sys.excepthook = _crash_hook
 
-    app = ContextMenuApp(sources, title_extra, backup_dir)
+    app = ContextMenuApp(sources, title_extra, backup_dir, argv)
     app.run()

@@ -18,6 +18,7 @@ class MenuEntry:
     enabled: bool       # True=已启用
     reg_path: str       # 完整注册表路径（HKCR 相对路径）
     source: str         # 来源标识，如 "*" / ".txt" / "Directory"
+    hidden_reason: str | None = None  # 隐藏原因，如 "按住 Shift 显示"
 
 
 def _read_value(path: str, name: str = "") -> str | None:
@@ -131,6 +132,7 @@ def scan_entries(subpath: str, source_label: str,
             enabled=r["enabled"],
             reg_path=r["reg_path"],
             source=source_label,
+            hidden_reason=r.get("hidden_reason"),
         )
         for r in raw
     ]

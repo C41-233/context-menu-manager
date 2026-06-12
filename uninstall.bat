@@ -1,14 +1,14 @@
 @echo off
 
 echo ========================================
-echo   右键菜单管理器 — 卸载
+echo   右键菜单管理器 —— 卸载
 echo ========================================
 echo.
 
-:: 1. 检测管理员权限
+:: 1. 获取管理员权限
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [提权] 需要管理员权限，正在请求提升...
+    echo [提权] 需要管理员权限，正在重新启动...
     powershell -Command "Start-Process '%~f0' -Verb RunAs -Wait"
     exit /b %errorlevel%
 )
@@ -39,8 +39,7 @@ if %errorlevel% equ 0 (
 echo.
 echo ========================================
 echo   卸载完成！
-echo   backups 文件夹保留在工具目录中，
-echo   如需恢复已删除的菜单项，请双击其中
-echo   的 .reg 文件。
+echo   backups 文件夹中保留着已删除菜单
+echo   的 .reg 备份文件，如需恢复请双击导入
 echo ========================================
 pause
