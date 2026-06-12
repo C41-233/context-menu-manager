@@ -6,6 +6,7 @@ import winreg
 from dataclasses import dataclass
 from registry_ops import read_shell_entries, _try_open_key
 from com_display_name import get_context_menu_display_names
+from log_utils import write_log
 
 HKCR = winreg.HKEY_CLASSES_ROOT
 
@@ -30,7 +31,7 @@ def _read_value(path: str, name: str = "") -> str | None:
         value, _ = winreg.QueryValueEx(k, name)
         k.Close()
         return value
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         k.Close()
         return None
 
@@ -138,6 +139,103 @@ def scan_entries(subpath: str, source_label: str,
     ]
 
 
+def scan_ext_menus(ext_lower: str,
+                    com_names: dict[str, str] | None = None) -> list[MenuEntry]:
+    """扫描指定扩展名的所有专属菜单项。
+
+    来源包括:
+      - ProgID shell（含 CurVer 重定向）
+      - SystemFileAssociations 按扩展名
+      - SystemFileAssociations 按感知类型
+    """
+    ext_menus: list[MenuEntry] = []
+
+    progid = resolve_progid(ext_lower)
+    if progid:
+        ext_menus.extend(scan_entries(f"{progid}\\shell", ext_lower, com_names))
+
+    sfa_ext_path = f"SystemFileAssociations\\{ext_lower}\\shell"
+    if _has_key(sfa_ext_path):
+        ext_menus.extend(scan_entries(sfa_ext_path, ext_lower, com_names))
+
+    perceived = read_perceived_type(ext_lower)
+    if perceived and perceived != ext_lower:
+        sfa_type_path = f"SystemFileAssociations\\{perceived}\\shell"
+        if _has_key(sfa_type_path):
+            ext_menus.extend(scan_entries(sfa_type_path, ext_lower, com_names))
+
+    return ext_menus
+
+
+def scan_shellex_handlers(subpath: str) -> list[MenuEntry]:
+    """扫描 shellex\\ContextMenuHandlers 下的所有 Shell 扩展。
+
+    每个扩展作为一个 MenuEntry，reg_path 指向其 CLSID 键，
+    可被整体删除（删除后该扩展的全部菜单项消失）。
+    """
+    handlers_path = f"{subpath}\\shellex\\ContextMenuHandlers"
+    k = _try_open_key(handlers_path, winreg.KEY_READ)
+    if k is None:
+        return []
+
+    entries: list[MenuEntry] = []
+    i = 0
+    while True:
+        try:
+            clsid = winreg.EnumKey(k, i)
+            i += 1
+        except OSError:
+            break
+
+        full_path = f"{handlers_path}\\{clsid}"
+        display_name = _read_value(full_path) or clsid
+        entries.append(MenuEntry(
+            name=clsid,
+            display_name=display_name,
+            command="由 Shell 扩展实现",
+            enabled=True,
+            reg_path=full_path,
+            source="ShellExt",
+            hidden_reason="包含动态子菜单，删除将移除整个扩展",
+        ))
+
+    k.Close()
+    return entries
+
+
+def _merge_com_entries(result: dict[str, list[MenuEntry]],
+                       com_names: dict[str, str],
+                       fallback_source: str):
+    """将 COM 发现但静态注册表扫描未覆盖的菜单项补充到结果中。
+
+    这些条目没有对应的注册表路径（由 shellex 扩展动态生成），
+    无法通过注册表启用/禁用或删除，仅作展示。
+    """
+    static_verbs: set[str] = set()
+    for entries in result.values():
+        for e in entries:
+            static_verbs.add(e.name.lower())
+
+    com_entries: list[MenuEntry] = []
+    for verb, display in com_names.items():
+        if verb.lower() not in static_verbs:
+            com_entries.append(MenuEntry(
+                name=verb,
+                display_name=display,
+                command="",
+                enabled=True,
+                reg_path="",
+                source=fallback_source,
+                hidden_reason="由 Shell 扩展提供",
+            ))
+
+    if com_entries:
+        if fallback_source in result:
+            result[fallback_source].extend(com_entries)
+        else:
+            result[fallback_source] = com_entries
+
+
 def scan_file_menus(filepath: str) -> dict[str, list[MenuEntry]]:
     """扫描文件右键菜单。
 
@@ -146,10 +244,10 @@ def scan_file_menus(filepath: str) -> dict[str, list[MenuEntry]]:
     2. HKCR\\{ProgID}\\shell\\ — 文件类型专属（含 CurVer 重定向）
     3. HKCR\\SystemFileAssociations\\{ext}\\shell\\ — 系统文件关联（按扩展名）
     4. HKCR\\SystemFileAssociations\\{PerceivedType}\\shell\\ — 系统文件关联（按感知类型）
+    5. COM IContextMenu — 捕获 shellex 扩展提供的动态菜单项
 
     对文件/目录场景尝试用 COM 获取跨语言一致的显示名，失败则回退到注册表。
     """
-    # 先尝试 COM 获取所有动词的显示名
     com_names = get_context_menu_display_names(filepath)
 
     result: dict[str, list[MenuEntry]] = {}
@@ -159,29 +257,21 @@ def scan_file_menus(filepath: str) -> dict[str, list[MenuEntry]]:
 
     # 2-4. 文件类型专属菜单
     _, ext = os.path.splitext(filepath)
-    if ext:
-        ext_lower = ext.lower()
-        ext_menus: list[MenuEntry] = []
-
-        # 2. ProgID shell
-        progid = resolve_progid(ext_lower)
-        if progid:
-            ext_menus.extend(scan_entries(f"{progid}\\shell", ext_lower, com_names))
-
-        # 3. SystemFileAssociations 按扩展名
-        sfa_ext_path = f"SystemFileAssociations\\{ext_lower}\\shell"
-        if _has_key(sfa_ext_path):
-            ext_menus.extend(scan_entries(sfa_ext_path, ext_lower, com_names))
-
-        # 4. SystemFileAssociations 按感知类型
-        perceived = read_perceived_type(ext_lower)
-        if perceived and perceived != ext_lower:
-            sfa_type_path = f"SystemFileAssociations\\{perceived}\\shell"
-            if _has_key(sfa_type_path):
-                ext_menus.extend(scan_entries(sfa_type_path, ext_lower, com_names))
-
+    ext_lower = ext.lower() if ext else ""
+    if ext_lower:
+        ext_menus = scan_ext_menus(ext_lower, com_names)
         if ext_menus:
             result[ext_lower] = ext_menus
+
+    # 5. 补充 COM 独有的菜单项（shellex 扩展）
+    _merge_com_entries(result, com_names, ext_lower or "*")
+
+    # 6. Shell 扩展（shellex\ContextMenuHandlers）— 作为可删除的整体入口
+    shellex_entries = scan_shellex_handlers("*")
+    if ext_lower:
+        shellex_entries.extend(scan_shellex_handlers(ext_lower))
+    if shellex_entries:
+        result["Shell 扩展"] = shellex_entries
 
     return result
 
@@ -192,11 +282,20 @@ def scan_directory_menus(dirpath: str = "") -> dict[str, list[MenuEntry]]:
     dirpath: 目录路径，用于 COM 显示名解析。为空时跳过 COM。
     """
     com_names = get_context_menu_display_names(dirpath) if dirpath else {}
-    entries = scan_entries("Directory\\shell", "Directory", com_names)
-    return {"Directory": entries}
+    result = {"Directory": scan_entries("Directory\\shell", "Directory", com_names)}
+    if com_names:
+        _merge_com_entries(result, com_names, "Directory")
+    shellex_entries = scan_shellex_handlers("Directory")
+    if shellex_entries:
+        result["Shell 扩展"] = shellex_entries
+    return result
 
 
 def scan_background_menus() -> dict[str, list[MenuEntry]]:
-    """扫描目录背景右键菜单。"""
+    """扫描目录背景右键菜单。
+
+    COM 显示名解析不适用于背景菜单（没有可传入 IContextMenu 的文件/目录对象），
+    因此仅使用注册表显示名和标准动词回退表。
+    """
     entries = scan_entries("Directory\\Background\\shell", "Directory\\Background")
     return {"Directory\\Background": entries}

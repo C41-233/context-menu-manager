@@ -89,6 +89,56 @@ def _com_release(ptr):
         _com_call(ptr, 2, ctypes.c_ulong)()
 
 
+# === 菜单项递归遍历 ===
+
+def _enum_menu_items(hmenu, call_GetCommandString,
+                     parent_display: str = "") -> dict[str, str]:
+    """递归遍历菜单句柄及所有子菜单，返回 {verb: hierarchical_display_name}。"""
+    result: dict[str, str] = {}
+    count = user32.GetMenuItemCount(hmenu)
+
+    for i in range(count):
+        display_buf = (c_wchar * 512)()
+        mii = MENUITEMINFOW()
+        mii.cbSize = sizeof(MENUITEMINFOW)
+        # MIIM_STRING | MIIM_FTYPE | MIIM_ID | MIIM_SUBMENU
+        mii.fMask = 0x00000040 | 0x00000002 | 0x00000001 | 0x00000004
+        mii.dwTypeData = cast(display_buf, wintypes.LPWSTR)
+        mii.cch = 512
+
+        if not user32.GetMenuItemInfoW(hmenu, i, True, byref(mii)):
+            continue
+        if mii.fType & 0x800:  # MFT_SEPARATOR
+            continue
+
+        raw_text = display_buf.value
+        hierarchical_text = f"{parent_display} ▸ {raw_text}" if parent_display else raw_text
+
+        # 获取动词
+        cmd_id = mii.wID
+        if cmd_id != 0:
+            verb_buf = (c_wchar * 256)()
+            try:
+                hr = call_GetCommandString(
+                    cmd_id, 0x4, None, cast(verb_buf, c_void_p), 256,
+                )
+            except OSError:
+                hr = -1
+            if hr == 0:
+                verb = verb_buf.value
+                if verb and hierarchical_text:
+                    result[verb] = hierarchical_text
+
+        # 递归展开子菜单
+        if mii.hSubMenu:
+            sub_result = _enum_menu_items(
+                mii.hSubMenu, call_GetCommandString, hierarchical_text,
+            )
+            result.update(sub_result)
+
+    return result
+
+
 # === 核心功能 ===
 
 def get_context_menu_display_names(filepath: str) -> dict[str, str]:
@@ -100,8 +150,8 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
       3. IShellFolder::GetUIObjectOf → IContextMenu
       4. CreatePopupMenu → 临时菜单句柄
       5. IContextMenu::QueryContextMenu → 填充菜单项
-      6. 遍历菜单项, 用 GetCommandString(GCS_VERBW) 取动词,
-         GetMenuItemInfoW 取显示文本
+      6. 递归遍历菜单项及子菜单, 用 GetCommandString(GCS_VERBW) 取动词,
+         GetMenuItemInfoW 取显示文本（级联子菜单以 ▸ 层级连接）
       7. 清理并返回 {verb: display_name}
 
     Args:
@@ -115,6 +165,8 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
 
     if not os.path.exists(filepath):
         return result
+
+    from log_utils import write_log as _wl
 
     # COM 初始化
     co_init = ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
@@ -130,6 +182,7 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
         pidl = c_void_p()
         hr = shell32.SHParseDisplayName(filepath, None, byref(pidl), 0, None)
         if hr != 0:
+            _wl(f"COM: SHParseDisplayName 失败 {filepath}, HRESULT=0x{hr:08X}")
             return result
 
         # 2. 绑定到父文件夹, 获取 IShellFolder 和子 PIDL
@@ -139,6 +192,7 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
             pidl, byref(IID_IShellFolder), byref(ppv), byref(child_pidl)
         )
         if hr != 0:
+            _wl(f"COM: SHBindToParent 失败 {filepath}, HRESULT=0x{hr:08X}")
             return result
         psf = ppv
 
@@ -158,6 +212,7 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
             byref(pcm_out),
         )
         if hr != 0:
+            _wl(f"COM: GetUIObjectOf 失败 {filepath}, HRESULT=0x{hr:08X}")
             return result
         pcm = pcm_out
 
@@ -176,48 +231,14 @@ def get_context_menu_display_names(filepath: str) -> dict[str, str]:
         if hr < 0:
             return result
 
-        # 6. 遍历菜单项, 匹配动词
-        count = user32.GetMenuItemCount(hmenu)
+        # 6. 递归遍历菜单项及子菜单
         call_GetCommandString = _com_call(
             pcm, 5, HRESULT,
             _UINT_PTR, wintypes.UINT,
             c_void_p, c_void_p, wintypes.UINT,
         )
 
-        for i in range(count):
-            # 先获取菜单项信息（含实际 command ID 和显示文本）
-            display_buf = (c_wchar * 512)()
-            mii = MENUITEMINFOW()
-            mii.cbSize = sizeof(MENUITEMINFOW)
-            # MIIM_STRING | MIIM_FTYPE | MIIM_ID
-            mii.fMask = 0x00000040 | 0x00000002 | 0x00000001
-            mii.dwTypeData = cast(display_buf, wintypes.LPWSTR)
-            mii.cch = 512
-
-            if not user32.GetMenuItemInfoW(hmenu, i, True, byref(mii)):
-                continue
-            if mii.fType & 0x800:  # MFT_SEPARATOR
-                continue
-
-            cmd_id = mii.wID
-            if cmd_id == 0:
-                continue
-
-            # 用实际 command ID 获取动词 (GCS_VERBW = 0x4)
-            verb_buf = (c_wchar * 256)()
-            try:
-                hr = call_GetCommandString(
-                    cmd_id, 0x4, None, cast(verb_buf, c_void_p), 256
-                )
-            except OSError:
-                continue
-            if hr != 0:
-                continue
-
-            verb = verb_buf.value
-            text = display_buf.value
-            if verb and text:
-                result[verb] = text
+        result = _enum_menu_items(hmenu, call_GetCommandString)
 
     finally:
         # 清理资源

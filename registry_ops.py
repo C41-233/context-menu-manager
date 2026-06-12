@@ -19,9 +19,9 @@ def resolve_indirect_string(raw: str) -> str:
         return raw
 
     # SHLoadIndirectString 接受完整的 @path,-resid 格式
-    buf = ctypes.create_unicode_buffer(512)
+    buf = ctypes.create_unicode_buffer(1024)
     shlwapi = ctypes.windll.shlwapi
-    hr = shlwapi.SHLoadIndirectString(raw, buf, 511, None)
+    hr = shlwapi.SHLoadIndirectString(raw, buf, 1023, None)
     if hr == 0:  # S_OK
         return buf.value
     return raw
@@ -58,7 +58,7 @@ def read_default_value(key_handle) -> Optional[str]:
     try:
         value, _ = winreg.QueryValueEx(key_handle, "")
         return value
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return None
 
 
@@ -67,7 +67,7 @@ def read_value(key_handle, name: str) -> Optional[str]:
     try:
         value, _ = winreg.QueryValueEx(key_handle, name)
         return value
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return None
 
 
@@ -103,9 +103,11 @@ def _read_shell_recursive(subpath: str, parent_display: str,
             display_name = f"{parent_display} ▸ {display_name}"
 
         command = ""
+        delegate_execute = ""
         cmd_key = _try_open_key(f"{full_path}\\command", winreg.KEY_READ)
         if cmd_key is not None:
             command = read_default_value(cmd_key) or ""
+            delegate_execute = read_value(cmd_key, "DelegateExecute") or ""
             cmd_key.Close()
 
         legacy_disable = read_value(item_key, "LegacyDisable")
@@ -119,6 +121,14 @@ def _read_shell_recursive(subpath: str, parent_display: str,
             hidden_reasons.append("按住 Shift 显示")
         if has_ext_key is not None:
             has_ext_key.Close()
+
+        # COM 委托：可见性由 shell 扩展动态控制，Win11 简化菜单通常不显示
+        if delegate_execute and not command:
+            hidden_reasons.append("COM 委托，可见性由 shell 扩展控制")
+
+        # ProgrammaticAccessOnly：仅允许程序调用，不显示在菜单中
+        if read_value(item_key, "ProgrammaticAccessOnly") is not None:
+            hidden_reasons.append("仅限程序调用")
 
         subcommands = read_value(item_key, "Subcommands")
         nested = f"{full_path}\\shell"
@@ -169,7 +179,9 @@ def set_disabled(reg_path: str, disabled: bool):
     reg_path: HKCR 下的相对路径，如 r"*\\shell\\VSCode"
     disabled: True=写入 LegacyDisable(禁用), False=删除 LegacyDisable(启用)
     """
-    key = _open_key(reg_path, winreg.KEY_SET_VALUE | winreg.KEY_READ)
+    key = _try_open_key(reg_path, winreg.KEY_SET_VALUE | winreg.KEY_READ)
+    if key is None:
+        return
 
     if disabled:
         winreg.SetValueEx(key, "LegacyDisable", 0, winreg.REG_SZ, "")
@@ -177,7 +189,7 @@ def set_disabled(reg_path: str, disabled: bool):
         try:
             winreg.DeleteValue(key, "LegacyDisable")
         except FileNotFoundError:
-            pass  # 本来就没有，忽略
+            pass
 
     key.Close()
 

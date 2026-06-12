@@ -1,7 +1,7 @@
 @echo off
 
 echo ========================================
-echo   右键菜单管理器 —— 安装
+echo   右键菜单管理器 — 安装
 echo ========================================
 echo.
 
@@ -30,7 +30,7 @@ echo [OK] textual 库已就绪
 :: 3. 获取管理员权限
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [提权] 需要管理员权限，正在重新启动...
+    echo [提权] 需要管理员权限，正在请求提升...
     powershell -Command "Start-Process '%~f0' -Verb RunAs -Wait"
     exit /b %errorlevel%
 )
@@ -40,14 +40,14 @@ echo [OK] 管理员权限已确认
 set "TOOL_DIR=%~dp0"
 set "TOOL_DIR=%TOOL_DIR:~0,-1%"
 
-:: 5. 注册右键菜单（Python 直写注册表，避免 reg add 的引号转义问题）
+:: 5. 注册右键菜单
 echo 正在注册右键菜单...
 python "%TOOL_DIR%\fix_install.py"
 echo.
 
 echo ========================================
 echo   安装完成！
-echo   现在可在文件/目录/目录背景上右键
+echo   现在可以右键点击文件/目录/目录背景
 echo   找到"右键菜单管理"选项
 echo ========================================
 pause
