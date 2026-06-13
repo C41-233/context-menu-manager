@@ -19,11 +19,22 @@ def _is_admin() -> bool:
 
 
 def _elevate_and_exit():
-    ctypes.windll.shell32.ShellExecuteW(
+    ret = ctypes.windll.shell32.ShellExecuteW(
         None, "runas", sys.executable,
         " ".join(f'"{a}"' for a in sys.argv), None, 1,
     )
-    sys.exit(0)
+    if ret > 32:
+        sys.exit(0)
+    # 提权被取消或失败，弹窗提示
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        "此工具需要管理员权限才能修改/删除注册表项。\n\n"
+        "请在下次运行时点击「是」允许提权，"
+        "或手动以管理员身份运行。",
+        "右键菜单管理器 — 提权失败",
+        0x10,  # MB_ICONERROR
+    )
+    sys.exit(1)
 
 
 def main():

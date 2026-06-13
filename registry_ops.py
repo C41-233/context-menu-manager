@@ -229,31 +229,84 @@ def read_key_tree(reg_path: str) -> dict:
     return tree
 
 
-def delete_key_tree(reg_path: str):
-    """递归删除一个注册表键树。
+def _resolve_delete_hive(reg_path: str) -> tuple[int, str, str]:
+    """解析 HKCR 相对路径到实际的 hive、父路径、键名。
 
-    winreg.DeleteKey 不支持删除有子键的键，需先递归删除子键。
+    Returns (hive, parent_relpath, key_name)。HKCU 优先于 HKLM。
     """
-    # 先获取父路径和键名
     parts = reg_path.rsplit("\\", 1)
     if len(parts) != 2:
         raise ValueError(f"无效的注册表路径: {reg_path}")
-    parent_path, key_name = parts
+    parent_relpath, key_name = parts
 
-    # 递归删除子键
-    _delete_key_recursive(parent_path, key_name)
+    # 探测实际 hive（HKCU 优先）
+    for hive, prefix_relpath in [
+        (winreg.HKEY_CURRENT_USER, "Software\\Classes"),
+        (winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\Classes"),
+    ]:
+        try:
+            full = f"{prefix_relpath}\\{parent_relpath}\\{key_name}"
+            k = winreg.OpenKey(hive, full, 0, winreg.KEY_READ)
+            k.Close()
+            return hive, f"{prefix_relpath}\\{parent_relpath}", key_name
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(f"注册表键不存在: {reg_path}")
 
 
-def _delete_key_recursive(parent_path: str, key_name: str):
-    """递归删除指定子键。打开子键 → 递归删其子键 → 关闭 → 从父键删除自身。"""
+def delete_key_tree(reg_path: str):
+    """递归删除一个注册表键树。直接操作底层 hive（HKCU 优先，HKLM 回退）。"""
+    # 先读取 CLSID（删除 handler 后就读取不到了）
+    clsid = _read_clsid_from_shellex(reg_path)
+
+    hive, parent_path, key_name = _resolve_delete_hive(reg_path)
+    _delete_key_recursive(hive, parent_path, key_name)
+
+    # 删除关联的 CLSID 键
+    if clsid:
+        _delete_clsid_key(clsid)
+
+
+def _read_clsid_from_shellex(reg_path: str) -> str:
+    """从 shellex 注册项读取其关联的 CLSID。"""
+    for hive, prefix in [
+        (winreg.HKEY_CURRENT_USER, "Software\\Classes"),
+        (winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\Classes"),
+    ]:
+        try:
+            full = f"{prefix}\\{reg_path}"
+            k = winreg.OpenKey(hive, full, 0, winreg.KEY_READ)
+            clsid, _ = winreg.QueryValueEx(k, "")
+            k.Close()
+            return clsid if clsid.startswith("{") else ""
+        except FileNotFoundError:
+            continue
+    return ""
+
+
+def _delete_clsid_key(clsid: str):
+    """删除 CLSID 注册项（尝试两个 hive）。"""
+    for hive, prefix in [
+        (winreg.HKEY_CURRENT_USER, "Software\\Classes"),
+        (winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\Classes"),
+    ]:
+        try:
+            _delete_key_recursive(hive, f"{prefix}\\CLSID", clsid)
+            return
+        except OSError:
+            continue
+
+
+def _delete_key_recursive(hive: int, parent_path: str, key_name: str):
+    """递归删除指定子键。"""
     full_path = f"{parent_path}\\{key_name}"
-    key = _open_key(full_path, winreg.KEY_ALL_ACCESS)
+    key = winreg.OpenKey(hive, full_path, 0, winreg.KEY_ALL_ACCESS)
 
     for sub_name in list_subkeys(key):
-        _delete_key_recursive(full_path, sub_name)
+        _delete_key_recursive(hive, full_path, sub_name)
 
     key.Close()
-    parent = _open_key(parent_path, winreg.KEY_ALL_ACCESS)
+    parent = winreg.OpenKey(hive, parent_path, 0, winreg.KEY_ALL_ACCESS)
     winreg.DeleteKey(parent, key_name)
     parent.Close()
 

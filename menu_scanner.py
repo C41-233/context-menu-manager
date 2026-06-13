@@ -429,14 +429,18 @@ def scan_file_menus(filepath: str) -> dict[str, list[MenuEntry]]:
 
     # 5. 构建 handler→verb 映射（标注 COM 合并条目来源）
     handler_verb_map = _build_handler_verb_map("*", filepath)
+    handler_verb_map.update(_build_handler_verb_map("Directory", filepath))
+    handler_verb_map.update(_build_handler_verb_map("Directory\\Background", filepath))
     if ext_lower:
         handler_verb_map.update(_build_handler_verb_map(ext_lower, filepath))
 
     # 6. 补充 COM 独有的菜单项（shellex 扩展），标注已知 handler
     _merge_com_entries(result, com_names, ext_lower or "*", handler_verb_map)
 
-    # 7. Shell 扩展（shellex\ContextMenuHandlers）— 实例化获取真实子菜单
+    # 7. Shell 扩展 — 扫描所有可能的注册路径
     shellex_entries = scan_shellex_handlers("*", filepath)
+    shellex_entries.extend(scan_shellex_handlers("Directory", filepath))
+    shellex_entries.extend(scan_shellex_handlers("Directory\\Background", filepath))
     if ext_lower:
         shellex_entries.extend(scan_shellex_handlers(ext_lower, filepath))
     if shellex_entries:
@@ -453,9 +457,13 @@ def scan_directory_menus(dirpath: str = "") -> dict[str, list[MenuEntry]]:
     com_names = get_context_menu_display_names(dirpath) if dirpath else {}
     result = {"Directory": scan_entries("Directory\\shell", "Directory", com_names)}
     if com_names:
-        handler_verb_map = _build_handler_verb_map("Directory", dirpath)
+        handler_verb_map = _build_handler_verb_map("*", dirpath)
+        handler_verb_map.update(_build_handler_verb_map("Directory", dirpath))
+        handler_verb_map.update(_build_handler_verb_map("Directory\\Background", dirpath))
         _merge_com_entries(result, com_names, "Directory", handler_verb_map)
-    shellex_entries = scan_shellex_handlers("Directory", dirpath)
+    shellex_entries = scan_shellex_handlers("*", dirpath)
+    shellex_entries.extend(scan_shellex_handlers("Directory", dirpath))
+    shellex_entries.extend(scan_shellex_handlers("Directory\\Background", dirpath))
     if shellex_entries:
         result["Shell 扩展"] = shellex_entries
     return result
