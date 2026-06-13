@@ -20,6 +20,7 @@ class MenuEntry:
     reg_path: str       # 完整注册表路径（HKCR 相对路径）
     source: str         # 来源标识，如 "*" / ".txt" / "Directory"
     hidden_reason: str | None = None  # 隐藏原因，如 "按住 Shift 显示"
+    clsid: str | None = None  # CLSID（仅 Shell 扩展条目）
 
 
 def _read_value(path: str, name: str = "") -> str | None:
@@ -249,7 +250,8 @@ def _build_handler_verb_map(subpath: str, filepath: str) -> dict[str, str]:
     return verb_map
 
 
-def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
+def scan_shellex_handlers(subpath: str, filepath: str = "",
+                         seen_clsids: set[str] | None = None) -> list[MenuEntry]:
     """扫描 shellex\\ContextMenuHandlers 下的所有 Shell 扩展。
 
     若有 filepath，对每个 CLSID 调用 COM 实例化获取真实子菜单项；
@@ -257,7 +259,13 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
 
     每个扩展的父级条目 reg_path 指向其 CLSID 键，可被整体删除；
     command 字段填入 DLL 路径以标识来源程序。
+
+    seen_clsids: 已处理过的 CLSID 集合（会被原地修改）。同一 CLSID 在
+                 不同注册路径下多次出现时，仅保留首次发现的条目。
     """
+    if seen_clsids is None:
+        seen_clsids = set()
+
     handlers_path = f"{subpath}\\shellex\\ContextMenuHandlers"
     k = _try_open_key(handlers_path, winreg.KEY_READ)
     if k is None:
@@ -300,6 +308,12 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
                         break
                 hk.Close()
 
+        # 去重：同一 CLSID 可能在多个注册路径下注册
+        dedup_key = actual_clsid if actual_clsid else f"{handler_name}@{full_path}"
+        if dedup_key in seen_clsids:
+            continue
+        seen_clsids.add(dedup_key)
+
         # 查询 DLL 路径及文件描述
         dll_path = _get_clsid_dll(actual_clsid) if actual_clsid else ""
         desc = _get_file_description(dll_path) if dll_path else ""
@@ -313,21 +327,25 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
         if filepath and actual_clsid:
             from com_display_name import get_handler_menu_items
             items = get_handler_menu_items(filepath, actual_clsid)
+            parent_display = f"{handler_name} ({actual_clsid})"
             if items:
                 entries.append(MenuEntry(
                     name=handler_name,
-                    display_name=handler_name,
+                    display_name=parent_display,
                     command=dll_info,
                     enabled=True,
                     reg_path=full_path,
                     source="Shell 扩展",
                     hidden_reason="删除将移除整个扩展",
+                    clsid=actual_clsid,
                 ))
                 for verb, display in items.items():
-                    if display.lstrip("&").startswith(handler_name):
-                        child_display = display
+                    clean = display.lstrip("&")
+                    if clean.startswith(handler_name):
+                        rest = clean[len(handler_name):]
+                        child_display = f"{parent_display}{rest}"
                     else:
-                        child_display = f"{handler_name} ▸ {display}"
+                        child_display = f"{parent_display} ▸ {display}"
                     entries.append(MenuEntry(
                         name=verb,
                         display_name=child_display,
@@ -340,12 +358,13 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
             else:
                 entries.append(MenuEntry(
                     name=handler_name,
-                    display_name=handler_name,
+                    display_name=parent_display,
                     command=dll_info,
                     enabled=True,
                     reg_path=full_path,
                     source="Shell 扩展",
                     hidden_reason="无法获取子菜单（COM 实例化失败）",
+                    clsid=actual_clsid,
                 ))
         else:
             entries.append(MenuEntry(
@@ -378,6 +397,9 @@ def _merge_com_entries(result: dict[str, list[MenuEntry]],
     com_entries: list[MenuEntry] = []
     for verb, display in com_names.items():
         if verb.lower() not in static_verbs:
+            # 来自 shellex handler 的项会出现在"Shell 扩展"标签页，此处跳过以免重复
+            if handler_verb_map and verb in handler_verb_map:
+                continue
             if handler_verb_map:
                 source_name = handler_verb_map.get(verb, "")
                 source_hint = f"来自 {source_name}" if source_name else "由 Shell 扩展提供"
@@ -437,12 +459,13 @@ def scan_file_menus(filepath: str) -> dict[str, list[MenuEntry]]:
     # 6. 补充 COM 独有的菜单项（shellex 扩展），标注已知 handler
     _merge_com_entries(result, com_names, ext_lower or "*", handler_verb_map)
 
-    # 7. Shell 扩展 — 扫描所有可能的注册路径
-    shellex_entries = scan_shellex_handlers("*", filepath)
-    shellex_entries.extend(scan_shellex_handlers("Directory", filepath))
-    shellex_entries.extend(scan_shellex_handlers("Directory\\Background", filepath))
+    # 7. Shell 扩展 — 扫描所有可能的注册路径（共享 seen_clsids 去重）
+    seen_clsids: set[str] = set()
+    shellex_entries = scan_shellex_handlers("*", filepath, seen_clsids)
+    shellex_entries.extend(scan_shellex_handlers("Directory", filepath, seen_clsids))
+    shellex_entries.extend(scan_shellex_handlers("Directory\\Background", filepath, seen_clsids))
     if ext_lower:
-        shellex_entries.extend(scan_shellex_handlers(ext_lower, filepath))
+        shellex_entries.extend(scan_shellex_handlers(ext_lower, filepath, seen_clsids))
     if shellex_entries:
         result["Shell 扩展"] = shellex_entries
 
@@ -461,9 +484,10 @@ def scan_directory_menus(dirpath: str = "") -> dict[str, list[MenuEntry]]:
         handler_verb_map.update(_build_handler_verb_map("Directory", dirpath))
         handler_verb_map.update(_build_handler_verb_map("Directory\\Background", dirpath))
         _merge_com_entries(result, com_names, "Directory", handler_verb_map)
-    shellex_entries = scan_shellex_handlers("*", dirpath)
-    shellex_entries.extend(scan_shellex_handlers("Directory", dirpath))
-    shellex_entries.extend(scan_shellex_handlers("Directory\\Background", dirpath))
+    seen_clsids: set[str] = set()
+    shellex_entries = scan_shellex_handlers("*", dirpath, seen_clsids)
+    shellex_entries.extend(scan_shellex_handlers("Directory", dirpath, seen_clsids))
+    shellex_entries.extend(scan_shellex_handlers("Directory\\Background", dirpath, seen_clsids))
     if shellex_entries:
         result["Shell 扩展"] = shellex_entries
     return result

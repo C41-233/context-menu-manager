@@ -131,6 +131,7 @@ class MenuListContainer(Container, can_focus=True):
             self._list_view = None
 
         visible = self._visible_entries()
+        visible.sort(key=lambda e: e.display_name.lower())
         items = []
         for e in visible:
             depth = e.display_name.count(" ▸ ")
