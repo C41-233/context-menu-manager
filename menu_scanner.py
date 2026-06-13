@@ -167,6 +167,54 @@ def scan_ext_menus(ext_lower: str,
     return ext_menus
 
 
+def _get_clsid_dll(clsid_str: str) -> str:
+    """查询 CLSID 对应的 DLL 路径。"""
+    for server_key in ("InprocServer32", "LocalServer32"):
+        dll = _read_value(f"CLSID\\{clsid_str}\\{server_key}")
+        if dll:
+            return dll
+    return ""
+
+
+def _get_file_description(dll_path: str) -> str:
+    """读取 DLL 版本资源中的 FileDescription。"""
+    dll_path = os.path.expandvars(dll_path)
+    if not os.path.exists(dll_path):
+        return ""
+
+    import ctypes as _ct
+    from ctypes import wintypes as _w
+
+    size = _ct.windll.version.GetFileVersionInfoSizeW(dll_path, None)
+    if size == 0:
+        return ""
+
+    buf = _ct.create_string_buffer(size)
+    if not _ct.windll.version.GetFileVersionInfoW(dll_path, 0, size, buf):
+        return ""
+
+    trans_ptr = _ct.c_void_p()
+    trans_len = _w.UINT()
+    if not _ct.windll.version.VerQueryValueW(
+        buf, r"\VarFileInfo\Translation",
+        _ct.byref(trans_ptr), _ct.byref(trans_len),
+    ):
+        return ""
+
+    code = _ct.cast(trans_ptr, _ct.POINTER(_w.DWORD))[0]
+    lang, cp = code & 0xFFFF, (code >> 16) & 0xFFFF
+    query = f"\\StringFileInfo\\{lang:04X}{cp:04X}\\FileDescription"
+
+    desc_ptr = _ct.c_void_p()
+    desc_len = _w.UINT()
+    if _ct.windll.version.VerQueryValueW(
+        buf, query, _ct.byref(desc_ptr), _ct.byref(desc_len),
+    ):
+        return _ct.cast(desc_ptr, _ct.c_wchar_p).value
+
+    return ""
+
+
 def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
     """扫描 shellex\\ContextMenuHandlers 下的所有 Shell 扩展。
 
@@ -174,7 +222,7 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
     实例化失败则回退到仅显示注册表静态信息。
 
     每个扩展的父级条目 reg_path 指向其 CLSID 键，可被整体删除；
-    子菜单条目仅作展示，不可单独操作。
+    command 字段填入 DLL 路径以标识来源程序。
     """
     handlers_path = f"{subpath}\\shellex\\ContextMenuHandlers"
     k = _try_open_key(handlers_path, winreg.KEY_READ)
@@ -218,23 +266,30 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
                         break
                 hk.Close()
 
+        # 查询 DLL 路径及文件描述
+        dll_path = _get_clsid_dll(actual_clsid) if actual_clsid else ""
+        desc = _get_file_description(dll_path) if dll_path else ""
+        if desc and dll_path:
+            dll_info = f"{desc} — {dll_path}"
+        elif dll_path:
+            dll_info = f"DLL: {dll_path}"
+        else:
+            dll_info = "由 Shell 扩展实现"
+
         if filepath and actual_clsid:
             from com_display_name import get_handler_menu_items
             items = get_handler_menu_items(filepath, actual_clsid)
             if items:
-                # 父级条目 — 有 reg_path，可删除
                 entries.append(MenuEntry(
                     name=handler_name,
                     display_name=handler_name,
-                    command="由 Shell 扩展实现",
+                    command=dll_info,
                     enabled=True,
                     reg_path=full_path,
                     source="Shell 扩展",
                     hidden_reason="删除将移除整个扩展",
                 ))
                 for verb, display in items.items():
-                    # 有些扩展返回的 display 已自带前缀（如 7-Zip），
-                    # 有些没有（如 TortoiseGit），按需加前缀
                     if display.lstrip("&").startswith(handler_name):
                         child_display = display
                     else:
@@ -252,7 +307,7 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
                 entries.append(MenuEntry(
                     name=handler_name,
                     display_name=handler_name,
-                    command="由 Shell 扩展实现",
+                    command=dll_info,
                     enabled=True,
                     reg_path=full_path,
                     source="Shell 扩展",
@@ -262,7 +317,7 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
             entries.append(MenuEntry(
                 name=handler_name,
                 display_name=handler_name,
-                command="由 Shell 扩展实现",
+                command=dll_info,
                 enabled=True,
                 reg_path=full_path,
                 source="Shell 扩展",

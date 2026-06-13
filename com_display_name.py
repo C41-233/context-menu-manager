@@ -45,6 +45,16 @@ IID_IExplorerCommand = GUID(
     (0xB5, 0x7C, 0xC7, 0xB1, 0xC3, 0x23, 0xE0, 0xB9)
 )
 
+IID_IShellItem2 = GUID(
+    0x7E9FB0D3, 0x919F, 0x4307,
+    (0xAB, 0x2E, 0x9B, 0x18, 0x60, 0x31, 0x0C, 0x93)
+)
+
+IID_IShellItemArray = GUID(
+    0xB63EA76D, 0x1F85, 0x456F,
+    (0xA1, 0x9C, 0x48, 0x15, 0x9E, 0xFA, 0x85, 0x8B)
+)
+
 
 # === MENUITEMINFOW 结构 ===
 
@@ -79,6 +89,35 @@ user32 = ctypes.windll.user32
 
 # 设置常用函数签名
 HRESULT = ctypes.c_long
+
+shell32.SHCreateItemFromParsingName.argtypes = [
+    wintypes.LPCWSTR, c_void_p, c_void_p, POINTER(c_void_p),
+]
+shell32.SHCreateItemFromParsingName.restype = HRESULT
+
+shell32.SHCreateShellItemArrayFromShellItem.argtypes = [
+    c_void_p, c_void_p, POINTER(c_void_p),
+]
+shell32.SHCreateShellItemArrayFromShellItem.restype = HRESULT
+
+
+def _create_shell_item_array(filepath: str) -> c_void_p:
+    """从文件路径创建 IShellItemArray，失败返回 NULL。"""
+    psi = c_void_p()
+    hr = shell32.SHCreateItemFromParsingName(
+        filepath, None,
+        byref(IID_IShellItem2), byref(psi),
+    )
+    if hr != 0:
+        return None
+    psia = c_void_p()
+    hr = shell32.SHCreateShellItemArrayFromShellItem(
+        psi, byref(IID_IShellItemArray), byref(psia),
+    )
+    _com_release(psi)
+    if hr != 0:
+        return None
+    return psia
 
 
 # === COM vtable 辅助 ===
@@ -154,15 +193,18 @@ def _enum_menu_items(hmenu, call_GetCommandString,
     return result
 
 
-def _enum_explorer_commands(pExplorerCommand, parent_display: str = ""
-                            ) -> dict[str, str]:
-    """递归遍历 IExplorerCommand 及其子命令，返回 {title: hierarchical_display_name}。"""
+def _enum_explorer_commands(pExplorerCommand, parent_display: str = "",
+                            psia=None) -> dict[str, str]:
+    """递归遍历 IExplorerCommand 及其子命令。
+
+    psia: IShellItemArray 指针（仅顶层传入，子命令传 None）。
+    """
     result: dict[str, str] = {}
 
     call_GetTitle = _com_call(pExplorerCommand, 3, HRESULT,
                               c_void_p, POINTER(c_void_p))
     pTitle = c_void_p()
-    hr = call_GetTitle(None, byref(pTitle))
+    hr = call_GetTitle(psia, byref(pTitle))
     title = ""
     if hr >= 0 and pTitle:
         title = cast(pTitle, wintypes.LPWSTR).value or ""
@@ -192,7 +234,7 @@ def _enum_explorer_commands(pExplorerCommand, parent_display: str = ""
             hr = call_Next(1, byref(pItem), byref(fetched))
             if hr < 0 or fetched.value == 0:
                 break
-            sub = _enum_explorer_commands(pItem, hierarchical)
+            sub = _enum_explorer_commands(pItem, hierarchical, None)
             result.update(sub)
             _com_release(pItem)
         _com_release(pEnum)
@@ -249,7 +291,10 @@ def get_handler_menu_items(filepath: str, clsid_str: str) -> dict[str, str]:
             return result
         psf = ppv
 
-        # 3. 从父目录获取 IDataObject（供 IShellExtInit 使用）
+        # 3. 创建 IShellItemArray（供 IExplorerCommand 使用）
+        psia = _create_shell_item_array(filepath)
+
+        # 4. 从父目录获取 IDataObject（供 IShellExtInit 使用）
         pdtobj_out = c_void_p()
         call_GetUIObjectOf = _com_call(
             psf, 10, HRESULT,
@@ -288,7 +333,7 @@ def get_handler_menu_items(filepath: str, clsid_str: str) -> dict[str, str]:
                 byref(IID_IExplorerCommand), byref(pexplorer),
             )
             if hr2 == 0:
-                result = _enum_explorer_commands(pexplorer)
+                result = _enum_explorer_commands(pexplorer, "", psia)
                 _com_release(pexplorer)
                 return result
             _wl(f"COM: CoCreateInstance 失败 {clsid_str}, IContextMenu=I0x{hr & 0xFFFFFFFF:08X}, IExplorerCommand=I0x{hr2 & 0xFFFFFFFF:08X}")
@@ -348,7 +393,7 @@ def get_handler_menu_items(filepath: str, clsid_str: str) -> dict[str, str]:
                 psei = None
                 _com_release(pcm)
                 pcm = None
-                result = _enum_explorer_commands(pexplorer)
+                result = _enum_explorer_commands(pexplorer, "", psia)
                 _com_release(pexplorer)
 
     except Exception as exc:
@@ -361,6 +406,7 @@ def get_handler_menu_items(filepath: str, clsid_str: str) -> dict[str, str]:
         _com_release(pcm)
         _com_release(pdtobj)
         _com_release(psf)
+        _com_release(psia)
         if pidl:
             ole32.CoTaskMemFree(pidl)
         if need_uninit:
