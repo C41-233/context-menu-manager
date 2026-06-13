@@ -215,6 +215,40 @@ def _get_file_description(dll_path: str) -> str:
     return ""
 
 
+def _build_handler_verb_map(subpath: str, filepath: str) -> dict[str, str]:
+    """遍历 shellex handlers，对可实例化的构建 {verb: handler_display_name} 映射。"""
+    from com_display_name import get_handler_menu_items
+
+    handlers_path = f"{subpath}\\shellex\\ContextMenuHandlers"
+    k = _try_open_key(handlers_path, winreg.KEY_READ)
+    if k is None:
+        return {}
+
+    verb_map: dict[str, str] = {}
+    i = 0
+    while True:
+        try:
+            key_name = winreg.EnumKey(k, i)
+            i += 1
+        except OSError:
+            break
+
+        default_val = _read_value(f"{handlers_path}\\{key_name}")
+        if default_val and default_val.startswith("{"):
+            handler_name = key_name
+            actual_clsid = default_val
+        else:
+            handler_name = default_val or key_name
+            actual_clsid = key_name if key_name.startswith("{") else ""
+
+        if actual_clsid:
+            items = get_handler_menu_items(filepath, actual_clsid)
+            for verb in items:
+                verb_map[verb] = handler_name
+    k.Close()
+    return verb_map
+
+
 def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
     """扫描 shellex\\ContextMenuHandlers 下的所有 Shell 扩展。
 
@@ -330,11 +364,11 @@ def scan_shellex_handlers(subpath: str, filepath: str = "") -> list[MenuEntry]:
 
 def _merge_com_entries(result: dict[str, list[MenuEntry]],
                        com_names: dict[str, str],
-                       fallback_source: str):
+                       fallback_source: str,
+                       handler_verb_map: dict[str, str] | None = None):
     """将 COM 发现但静态注册表扫描未覆盖的菜单项补充到结果中。
 
-    这些条目没有对应的注册表路径（由 shellex 扩展动态生成），
-    无法通过注册表启用/禁用或删除，仅作展示。
+    handler_verb_map: {verb: handler_name} — 已实例化 handler，标注具体来源。
     """
     static_verbs: set[str] = set()
     for entries in result.values():
@@ -344,6 +378,11 @@ def _merge_com_entries(result: dict[str, list[MenuEntry]],
     com_entries: list[MenuEntry] = []
     for verb, display in com_names.items():
         if verb.lower() not in static_verbs:
+            if handler_verb_map:
+                source_name = handler_verb_map.get(verb, "")
+                source_hint = f"来自 {source_name}" if source_name else "由 Shell 扩展提供"
+            else:
+                source_hint = "由 Shell 扩展提供"
             com_entries.append(MenuEntry(
                 name=verb,
                 display_name=display,
@@ -351,7 +390,7 @@ def _merge_com_entries(result: dict[str, list[MenuEntry]],
                 enabled=True,
                 reg_path="",
                 source=fallback_source,
-                hidden_reason="由 Shell 扩展提供",
+                hidden_reason=source_hint,
             ))
 
     if com_entries:
@@ -388,10 +427,15 @@ def scan_file_menus(filepath: str) -> dict[str, list[MenuEntry]]:
         if ext_menus:
             result[ext_lower] = ext_menus
 
-    # 5. 补充 COM 独有的菜单项（shellex 扩展）
-    _merge_com_entries(result, com_names, ext_lower or "*")
+    # 5. 构建 handler→verb 映射（标注 COM 合并条目来源）
+    handler_verb_map = _build_handler_verb_map("*", filepath)
+    if ext_lower:
+        handler_verb_map.update(_build_handler_verb_map(ext_lower, filepath))
 
-    # 6. Shell 扩展（shellex\ContextMenuHandlers）— 实例化获取真实子菜单
+    # 6. 补充 COM 独有的菜单项（shellex 扩展），标注已知 handler
+    _merge_com_entries(result, com_names, ext_lower or "*", handler_verb_map)
+
+    # 7. Shell 扩展（shellex\ContextMenuHandlers）— 实例化获取真实子菜单
     shellex_entries = scan_shellex_handlers("*", filepath)
     if ext_lower:
         shellex_entries.extend(scan_shellex_handlers(ext_lower, filepath))
@@ -409,7 +453,8 @@ def scan_directory_menus(dirpath: str = "") -> dict[str, list[MenuEntry]]:
     com_names = get_context_menu_display_names(dirpath) if dirpath else {}
     result = {"Directory": scan_entries("Directory\\shell", "Directory", com_names)}
     if com_names:
-        _merge_com_entries(result, com_names, "Directory")
+        handler_verb_map = _build_handler_verb_map("Directory", dirpath)
+        _merge_com_entries(result, com_names, "Directory", handler_verb_map)
     shellex_entries = scan_shellex_handlers("Directory", dirpath)
     if shellex_entries:
         result["Shell 扩展"] = shellex_entries

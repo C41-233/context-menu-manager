@@ -322,14 +322,14 @@ def get_handler_menu_items(filepath: str, clsid_str: str) -> dict[str, str]:
         # 创建一个实例，获取 IContextMenu 接口
         pcm = c_void_p()
         hr = ole32.CoCreateInstance(
-            byref(clsid), None, 1,  # CLSCTX_INPROC_SERVER
+            byref(clsid), None, 5,  # CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER  # CLSCTX_INPROC_SERVER
             byref(IID_IContextMenu), byref(pcm),
         )
         if hr != 0:
             # 回退：尝试 IExplorerCommand（Win11 新接口）
             pexplorer = c_void_p()
             hr2 = ole32.CoCreateInstance(
-                byref(clsid), None, 1,
+                byref(clsid), None, 5,  # CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER
                 byref(IID_IExplorerCommand), byref(pexplorer),
             )
             if hr2 == 0:
@@ -384,7 +384,7 @@ def get_handler_menu_items(filepath: str, clsid_str: str) -> dict[str, str]:
                 hmenu = None
             pexplorer = c_void_p()
             hr2 = ole32.CoCreateInstance(
-                byref(clsid), None, 1,
+                byref(clsid), None, 5,  # CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER
                 byref(IID_IExplorerCommand), byref(pexplorer),
             )
             if hr2 == 0:
