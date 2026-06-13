@@ -1,24 +1,24 @@
 @echo off
+cd /d "%~dp0"
 
-REM ---- Auto-detect Git Bash ----
-set "BASH="
-rem 1) Try registry
-for /f "tokens=2*" %%a in ('reg query "HKLM\SOFTWARE\GitForWindows" /v InstallPath 2^>nul') do set "GIT_DIR=%%b"
-if defined GIT_DIR if exist "%GIT_DIR%\bin\bash.exe" set "BASH=%GIT_DIR%\bin\bash.exe"
-rem 2) Try common paths
-if not defined BASH for %%d in (
+REM ---- Auto-detect Git root ----
+set "GIT_ROOT="
+for /f "tokens=2*" %%a in ('reg query "HKLM\SOFTWARE\GitForWindows" /v InstallPath 2^>nul') do set "GIT_ROOT=%%b"
+if not defined GIT_ROOT for %%d in (
     "C:\Program Files\Git"
     "C:\Program Files (x86)\Git"
     "%LOCALAPPDATA%\Programs\Git"
-) do if exist "%%~d\bin\bash.exe" set "BASH=%%~d\bin\bash.exe"
-rem 3) Try PATH
-if not defined BASH for /f "delims=" %%a in ('where bash.exe 2^>nul') do set "BASH=%%a"
-if not defined BASH (
-    echo Git Bash not found. Please install Git for Windows.
+) do if exist "%%~d\usr\bin\bash.exe" set "GIT_ROOT=%%~d"
+if not defined GIT_ROOT (
+    echo Git not found. Please install Git for Windows.
     pause
     exit /b 1
 )
 
-REM ---- Run the companion bash script ----
-"%BASH%" --login "%~dp0push.sh"
+REM Use the real bash (usr/bin/bash.exe), not the stub (bin/bash.exe)
+set "BASH=%GIT_ROOT%\usr\bin\bash.exe"
+set "PATH=%GIT_ROOT%\usr\bin;%GIT_ROOT%\mingw64\bin;%GIT_ROOT%\cmd;%PATH%"
+set "MSYSTEM=MINGW64"
+
+"%BASH%" "%~dp0push.sh"
 pause
